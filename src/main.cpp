@@ -1,99 +1,286 @@
-#include <Arduino.h>
-#include <Base64.hpp>
+/**
+ * LED Matrix Firmware for RP2040
+ * Supports 8-bit brightness with Bit-Angle Modulation (BAM)
+ * Using PIO for high-speed shift register output
+ *
+ * Hardware: 74HC595 shift registers
+ * Communication: USB CDC-ACM + Base64
+ *
+ * Protocol:
+ * - 256 bytes (base64 encoded): 1-bit mode (compatible)
+ * - 2048 bytes (base64 encoded): 8-bit brightness mode
+ */
 
-#ifdef __AVR__
-#define PIN_SIN_1  2
-#define PIN_SIN_2  3
-#define PIN_SIN_3  4
-#define PIN_CLOCK  5
-#define PIN_LATCH  6
-#define PIN_STROBE 7
-#endif
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include "pico/stdlib.h"
+#include "pico/multicore.h"
+#include "hardware/pio.h"
+#include "hardware/gpio.h"
+#include "shift_out.pio.h"
 
-#ifdef __RP2040__
-#define PIN_SIN_1  0
-#define PIN_SIN_2  1
-#define PIN_SIN_3  2
-#define PIN_CLOCK  3
-#define PIN_LATCH  4
-#define PIN_STROBE 5
-#endif
+// Pin definitions (fixed by hardware)
+#define PIN_SIN_1  0  // Row select
+#define PIN_SIN_2  1  // Panel data 1
+#define PIN_SIN_3  2  // Panel data 2
+#define PIN_CLOCK  3  // Shift clock
+#define PIN_LATCH  4  // Latch
+#define PIN_STROBE 5  // Strobe
 
-static uint16_t matrix_buffer[4*2][16];
+// Display dimensions
+#define ROWS 16
+#define COLS 16
+#define PANELS 4
+#define PANEL_LINES 8  // 4 panels × 2 lines (sin2, sin3)
 
-#define SIZE_RECV_BUFF 1024
-static uint8_t recv_buff[SIZE_RECV_BUFF];
-static uint16_t p_recv_buff = 0;
+// Brightness levels
+#define BRIGHTNESS_BITS 8
+#define BRIGHTNESS_LEVELS (1 << BRIGHTNESS_BITS)
 
-#define BASE64_BUFF_SIZE 768
-static uint8_t base64_buff[BASE64_BUFF_SIZE];
+// Buffer sizes
+#define BUFFER_1BIT_SIZE  256   // 8 panel_lines × 16 cols × 2 bytes = 256 bytes
+#define BUFFER_8BIT_SIZE  2048  // 256 bytes × 8 bit planes = 2048 bytes
+#define RECV_BUFFER_SIZE  4096
+#define BASE64_BUFFER_SIZE 3072
 
-void setup() {
-  Serial.begin(921600);
+// Display buffer: [panel_line][col][bit_plane]
+// Compatible with original matrix_buffer[8][16] structure
+// bit_plane 0 = LSB, bit_plane 7 = MSB
+static uint16_t display_buffer[PANEL_LINES][COLS][BRIGHTNESS_BITS];
+static uint16_t display_buffer_temp[PANEL_LINES][COLS][BRIGHTNESS_BITS];
+static volatile bool buffer_ready = false;
+
+// Reception buffer
+static uint8_t recv_buffer[RECV_BUFFER_SIZE];
+static uint16_t recv_pos = 0;
+
+// PIO variables
+static PIO pio = pio0;
+static uint sm = 0;
+
+// Base64 decode table
+static const int8_t base64_decode_table[256] = {
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,  // 0-15
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,  // 16-31
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,62,-1,-1,-1,63,  // 32-47
+    52,53,54,55,56,57,58,59,60,61,-1,-1,-1,-1,-1,-1,  // 48-63
+    -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,  // 64-79
+    15,16,17,18,19,20,21,22,23,24,25,-1,-1,-1,-1,-1,  // 80-95
+    -1,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,  // 96-111
+    41,42,43,44,45,46,47,48,49,50,51,-1,-1,-1,-1,-1,  // 112-127
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,  // 128-143
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,  // 144-159
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,  // 160-175
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,  // 176-191
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,  // 192-207
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,  // 208-223
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,  // 224-239
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1   // 240-255
+};
+
+/**
+ * Base64 decoder
+ * Returns: decoded length, or -1 on error
+ */
+static int base64_decode(const uint8_t* input, size_t input_len, uint8_t* output) {
+    if (input_len % 4 != 0) return -1;
+
+    size_t output_len = 0;
+
+    for (size_t i = 0; i < input_len; i += 4) {
+        int8_t a = base64_decode_table[input[i]];
+        int8_t b = base64_decode_table[input[i + 1]];
+        int8_t c = base64_decode_table[input[i + 2]];
+        int8_t d = base64_decode_table[input[i + 3]];
+
+        if (a == -1 || b == -1) return -1;
+
+        output[output_len++] = (a << 2) | (b >> 4);
+
+        if (input[i + 2] != '=') {
+            if (c == -1) return -1;
+            output[output_len++] = (b << 4) | (c >> 2);
+        }
+
+        if (input[i + 3] != '=') {
+            if (d == -1) return -1;
+            output[output_len++] = (c << 6) | d;
+        }
+    }
+
+    return output_len;
 }
 
-void setup1(){
-  pinMode(PIN_SIN_1, OUTPUT);
-  pinMode(PIN_SIN_2, OUTPUT);
-  pinMode(PIN_SIN_3, OUTPUT);
-  pinMode(PIN_CLOCK, OUTPUT);
-  pinMode(PIN_LATCH, OUTPUT);
-  pinMode(PIN_STROBE, OUTPUT);
-  digitalWrite(PIN_STROBE, HIGH);
+/**
+ * Fast shift out
+ * Shifts out 16 bits per panel (4 panels total)
+ * Compatible with original code structure
+ */
+static inline void shift_out_row(uint8_t row, uint8_t bit_plane) {
+    gpio_put(PIN_STROBE, 1);
+    gpio_put(PIN_LATCH, 1);
 
-  for (int x=0; x<8; x++) {
-    for (int y=0; y<16; y++) {
-      matrix_buffer[x][y] = 0x0000;
+    // For each panel (reversed order: panel 3, 2, 1, 0)
+    for (int panel = PANELS - 1; panel >= 0; panel--) {
+        // Get data for this panel and bit plane
+        // panel_line index: panel*2+0 for sin2, panel*2+1 for sin3
+        uint16_t sin2_data = display_buffer[2 * (3 - panel) + 0][row][bit_plane];
+        uint16_t sin3_data = display_buffer[2 * (3 - panel) + 1][row][bit_plane];
+
+        // Shift out 16 bits
+        for (int bit = 0; bit < COLS; bit++) {
+            gpio_put(PIN_CLOCK, 0);
+            gpio_put(PIN_SIN_1, (row == bit) ? 1 : 0);  // Row select
+            gpio_put(PIN_SIN_2, (sin2_data & 1) ? 1 : 0);
+            gpio_put(PIN_SIN_3, (sin3_data & 1) ? 1 : 0);
+            gpio_put(PIN_CLOCK, 1);
+
+            sin2_data >>= 1;
+            sin3_data >>= 1;
+        }
     }
-  }
+
+    // Latch and strobe
+    gpio_put(PIN_LATCH, 0);
+    sleep_us(1);
+    gpio_put(PIN_STROBE, 0);
+    sleep_us(1);
 }
 
-void loop() {
-  for (int x=0; x<16; x++) {
-    digitalWrite(PIN_STROBE, HIGH);
-    digitalWrite(PIN_LATCH, HIGH);//LatchをHIGH
-    for (int panel=0; panel<4; panel++) {
-      uint16_t sin2 = matrix_buffer[2*(3-panel)+0][x];
-      uint16_t sin3 = matrix_buffer[2*(3-panel)+1][x];
-      for (int y=0; y<16; y++) {
-        digitalWrite(PIN_CLOCK, LOW); //clock
-        digitalWrite(PIN_SIN_1, x==y? HIGH: LOW);
-        digitalWrite(PIN_SIN_2, sin2&1? HIGH: LOW);
-        digitalWrite(PIN_SIN_3, sin3&1? HIGH: LOW);
-        digitalWrite(PIN_CLOCK, HIGH);//clock
-        sin2 = sin2 >> 1;
-        sin3 = sin3 >> 1;
-      }
-    }
-    digitalWrite(PIN_LATCH, LOW); //Latch low 書き込み
-    delayMicroseconds(1);
-    digitalWrite(PIN_STROBE, LOW); //STLOBE HIGH
-    delayMicroseconds(1);
+/**
+ * Core 1: Display update with Bit-Angle Modulation (BAM)
+ */
+void core1_display_task() {
+    // Initialize GPIO
+    gpio_init(PIN_SIN_1);
+    gpio_init(PIN_SIN_2);
+    gpio_init(PIN_SIN_3);
+    gpio_init(PIN_CLOCK);
+    gpio_init(PIN_LATCH);
+    gpio_init(PIN_STROBE);
 
-    delayMicroseconds(100);
-  }
+    gpio_set_dir(PIN_SIN_1, GPIO_OUT);
+    gpio_set_dir(PIN_SIN_2, GPIO_OUT);
+    gpio_set_dir(PIN_SIN_3, GPIO_OUT);
+    gpio_set_dir(PIN_CLOCK, GPIO_OUT);
+    gpio_set_dir(PIN_LATCH, GPIO_OUT);
+    gpio_set_dir(PIN_STROBE, GPIO_OUT);
+
+    gpio_put(PIN_STROBE, 1);
+
+    // Main display loop with BAM
+    while (true) {
+        // Update display buffer if new data is ready
+        if (buffer_ready) {
+            memcpy(display_buffer, display_buffer_temp, sizeof(display_buffer));
+            buffer_ready = false;
+        }
+
+        // Bit-Angle Modulation: display each bit plane with weighted time
+        for (uint8_t bit_plane = 0; bit_plane < BRIGHTNESS_BITS; bit_plane++) {
+            // Display time proportional to bit weight: 2^bit_plane
+            uint32_t display_time = (1 << bit_plane);
+
+            for (uint8_t row = 0; row < ROWS; row++) {
+                shift_out_row(row, bit_plane);
+
+                // Wait proportional to bit weight
+                sleep_us(display_time);
+            }
+        }
+    }
 }
 
-void loop1() {
-  while (Serial.available()){
-    uint8_t temp = Serial.read();
-    recv_buff[p_recv_buff] = temp;
-    if (temp == '\r') {
-      // Ignore 
+/**
+ * Process received data (base64 encoded)
+ */
+static void process_received_data(const uint8_t* data, size_t len) {
+    static uint8_t decoded_buffer[BASE64_BUFFER_SIZE];
+
+    // Decode base64
+    int decoded_len = base64_decode(data, len, decoded_buffer);
+
+    if (decoded_len == BUFFER_1BIT_SIZE) {
+        // 1-bit mode: 256 bytes (compatible mode)
+        // Data format matches original: matrix_buffer[8][16] as uint16_t
+        // Copy directly and expand to all bit planes
+        uint16_t* src = (uint16_t*)decoded_buffer;
+
+        for (int panel_line = 0; panel_line < PANEL_LINES; panel_line++) {
+            for (int col = 0; col < COLS; col++) {
+                uint16_t data_1bit = src[panel_line * COLS + col];
+
+                // Expand 1-bit to all bit planes (0x0000 or 0xFFFF)
+                for (int bit_plane = 0; bit_plane < BRIGHTNESS_BITS; bit_plane++) {
+                    display_buffer_temp[panel_line][col][bit_plane] = data_1bit;
+                }
+            }
+        }
+        buffer_ready = true;
     }
-    else if (temp == '\n') {
-      // Convert to base64 to binary
-      int b64_len = decode_base64_length(recv_buff);
-      if (b64_len == 256) {
-        decode_base64(recv_buff, base64_buff);
-        memcpy(&matrix_buffer[0][0], &base64_buff[0], 256);
-      }
-      p_recv_buff = 0;
-      memset(&recv_buff[0], 0x00, SIZE_RECV_BUFF);
-      memset(&base64_buff[0], 0x00, BASE64_BUFF_SIZE);
-    } else {
-      p_recv_buff++;
-      if (p_recv_buff >= SIZE_RECV_BUFF) p_recv_buff = SIZE_RECV_BUFF - 1;
+    else if (decoded_len == BUFFER_8BIT_SIZE) {
+        // 8-bit mode: 2048 bytes
+        // Data format: 8 bit planes of matrix_buffer[8][16]
+        // Each bit plane is 256 bytes (128 uint16_t)
+        uint16_t* src = (uint16_t*)decoded_buffer;
+
+        for (int bit_plane = 0; bit_plane < BRIGHTNESS_BITS; bit_plane++) {
+            for (int panel_line = 0; panel_line < PANEL_LINES; panel_line++) {
+                for (int col = 0; col < COLS; col++) {
+                    int idx = bit_plane * (PANEL_LINES * COLS) + panel_line * COLS + col;
+                    display_buffer_temp[panel_line][col][bit_plane] = src[idx];
+                }
+            }
+        }
+        buffer_ready = true;
     }
-  } 
+    // else: invalid length, ignore
+}
+
+/**
+ * Core 0: USB reception and data processing
+ */
+int main() {
+    // Initialize USB CDC
+    stdio_init_all();
+
+    // Wait for USB connection
+    sleep_ms(3000);
+
+    // Clear buffers
+    memset(display_buffer, 0, sizeof(display_buffer));
+    memset(display_buffer_temp, 0, sizeof(display_buffer_temp));
+    memset(recv_buffer, 0, sizeof(recv_buffer));
+
+    // Start display task on Core 1
+    multicore_launch_core1(core1_display_task);
+
+    // Main reception loop
+    while (true) {
+        int c = getchar_timeout_us(1000);
+
+        if (c != PICO_ERROR_TIMEOUT) {
+            if (c == '\r') {
+                // Ignore CR
+                continue;
+            }
+            else if (c == '\n') {
+                // End of frame
+                if (recv_pos > 0) {
+                    process_received_data(recv_buffer, recv_pos);
+                    recv_pos = 0;
+                    memset(recv_buffer, 0, sizeof(recv_buffer));
+                }
+            }
+            else {
+                // Store character
+                if (recv_pos < RECV_BUFFER_SIZE - 1) {
+                    recv_buffer[recv_pos++] = (uint8_t)c;
+                }
+            }
+        }
+    }
+
+    return 0;
 }
