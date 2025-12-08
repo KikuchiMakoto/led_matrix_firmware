@@ -18,13 +18,9 @@ add_executable(led_matrix_firmware
     src/main.cpp
 )
 
-# Generate PIO header
-pico_generate_pio_header(led_matrix_firmware ${CMAKE_CURRENT_LIST_DIR}/src/shift_out.pio)
-
 target_link_libraries(led_matrix_firmware
     pico_stdlib
     pico_multicore
-    hardware_pio
     hardware_gpio
 )
 

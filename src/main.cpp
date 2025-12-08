@@ -1,7 +1,7 @@
 /**
  * LED Matrix Firmware for RP2040
  * Supports 8-bit brightness with Bit-Angle Modulation (BAM)
- * Using PIO for high-speed shift register output
+ * Using direct GPIO control for high-speed shift register output
  *
  * Hardware: 74HC595 shift registers
  * Communication: USB CDC-ACM + Base64
@@ -16,9 +16,7 @@
 #include <stdlib.h>
 #include "pico/stdlib.h"
 #include "pico/multicore.h"
-#include "hardware/pio.h"
 #include "hardware/gpio.h"
-#include "shift_out.pio.h"
 
 // Pin definitions (fixed by hardware)
 #define PIN_SIN_1  0  // Row select
@@ -54,10 +52,6 @@ static volatile bool buffer_ready = false;
 // Reception buffer
 static uint8_t recv_buffer[RECV_BUFFER_SIZE];
 static uint16_t recv_pos = 0;
-
-// PIO variables
-static PIO pio = pio0;
-static uint sm = 0;
 
 // Base64 decode table
 static const int8_t base64_decode_table[256] = {
