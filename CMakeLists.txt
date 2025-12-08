@@ -1,5 +1,8 @@
 cmake_minimum_required(VERSION 3.13)
 
+# Set Pico SDK path to submodule
+set(PICO_SDK_PATH ${CMAKE_CURRENT_LIST_DIR}/pico-sdk)
+
 # Pull in SDK (must be before project)
 include(pico_sdk_import.cmake)
 

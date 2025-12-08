@@ -51,36 +51,43 @@ USB CDC-ACM経由でBase64エンコードされたデータを送信します。
 ## ビルド方法
 
 ### 必要なもの
-- PlatformIO（推奨）
-- または CMake + Pico SDK
+- CMake 3.13以上
+- GCC ARM Embedded Toolchain
+- Git
 
-### PlatformIOでビルド
+### リポジトリのクローン
 
 ```bash
-# Pico SDK環境でビルド
-pio run -e rp2040_pico_sdk
+# リポジトリをクローン
+git clone <repository-url>
+cd LED_Matrix_firmware_K00798
 
-# アップロード
-pio run -e rp2040_pico_sdk -t upload
+# サブモジュール（Pico SDK）を初期化
+git submodule update --init --recursive
 ```
 
-### CMakeでビルド
+### ビルド
 
 ```bash
-# Pico SDKのパスを設定（環境に応じて変更）
-export PICO_SDK_PATH=/path/to/pico-sdk
-
 # ビルドディレクトリを作成
 mkdir build
 cd build
 
-# CMake実行
+# CMake実行とビルド
 cmake ..
-
-# ビルド
-make
+make -j4
 
 # 生成されたファイル: led_matrix_firmware.uf2
+```
+
+### 書き込み
+
+```bash
+# RP2040をBOOTSELモードで接続
+# （BOOTSELボタンを押しながらUSB接続）
+
+# .uf2ファイルをRP2040のマスストレージにコピー
+cp led_matrix_firmware.uf2 /media/$USER/RPI-RP2/
 ```
 
 ## 使用方法
