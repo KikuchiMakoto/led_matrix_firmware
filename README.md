@@ -5,10 +5,27 @@ RP2040専用のLEDマトリクスファームウェアです。74HC595シフト�
 ## 特徴
 
 - **8bit輝度対応**: Bit-Angle Modulation (BAM)による256段階の輝度制御
-- **高速動作**: GPIO直接制御による高速シフト出力
+- **3つの転送モード**: GPIO直接制御、DMA+SPI、PIOによる高速化オプション
 - **互換性**: 従来の1bitモードとの後方互換性を維持
 - **マルチコア**: RP2040の2コアを活用（Core0: データ受信、Core1: 表示更新）
 - **USB CDC-ACM**: Base64エンコードされたデータをUSB経由で受信
+
+## 転送モード
+
+### Mode 0: GPIO直接制御（デフォルト）
+- `gpio_put()`による直接制御
+- シンプルで確実
+- 最も基本的な実装
+
+### Mode 1: DMA + SPI
+- SPIペリフェラルとDMAを使用
+- CPU負荷を軽減
+- DMAによる自動転送
+
+### Mode 2: PIO
+- Programmable I/Oによるハードウェアアクセラレーション
+- 最も高速
+- PIOステートマシンで並列処理
 
 ## ハードウェア
 
@@ -76,24 +93,45 @@ git submodule update --init --recursive
 
 ### ビルド
 
+#### デフォルト（GPIO直接制御）
+
 ```bash
-# ビルドディレクトリを作成
-mkdir build
-cd build
-
-# CMake実行（Ninja使用）
+mkdir build && cd build
 cmake -G Ninja ..
-
-# ビルド
 ninja
-
-# 生成されたファイル: led_matrix_firmware.uf2
 ```
 
-または、ワンライナーで：
+#### 転送モードを指定してビルド
 
 ```bash
+mkdir build && cd build
+
+# Mode 0: GPIO直接制御（デフォルト）
+cmake -G Ninja -DTRANSFER_MODE=0 ..
+ninja
+
+# Mode 1: DMA + SPI
+cmake -G Ninja -DTRANSFER_MODE=1 ..
+ninja
+
+# Mode 2: PIO
+cmake -G Ninja -DTRANSFER_MODE=2 ..
+ninja
+```
+
+生成されたファイル: `led_matrix_firmware.uf2`
+
+#### ワンライナー
+
+```bash
+# GPIO mode (default)
 mkdir -p build && cd build && cmake -G Ninja .. && ninja
+
+# DMA mode
+mkdir -p build && cd build && cmake -G Ninja -DTRANSFER_MODE=1 .. && ninja
+
+# PIO mode
+mkdir -p build && cd build && cmake -G Ninja -DTRANSFER_MODE=2 .. && ninja
 ```
 
 ### 書き込み

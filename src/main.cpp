@@ -1,7 +1,7 @@
 /**
  * LED Matrix Firmware for RP2040
  * Supports 8-bit brightness with Bit-Angle Modulation (BAM)
- * Using direct GPIO control for high-speed shift register output
+ * Multiple transfer modes for performance comparison
  *
  * Hardware: 74HC595 shift registers
  * Communication: USB CDC-ACM + Base64
@@ -9,7 +9,17 @@
  * Protocol:
  * - 256 bytes (base64 encoded): 1-bit mode (compatible)
  * - 2048 bytes (base64 encoded): 8-bit brightness mode
+ *
+ * Transfer modes:
+ * - TRANSFER_MODE 0: GPIO direct control
+ * - TRANSFER_MODE 1: DMA + SPI
+ * - TRANSFER_MODE 2: PIO
  */
+
+// Select transfer mode (0: GPIO, 1: DMA, 2: PIO)
+#ifndef TRANSFER_MODE
+#define TRANSFER_MODE 0
+#endif
 
 #include <stdio.h>
 #include <string.h>
@@ -17,6 +27,16 @@
 #include "pico/stdlib.h"
 #include "pico/multicore.h"
 #include "hardware/gpio.h"
+
+#if TRANSFER_MODE == 1
+#include "hardware/spi.h"
+#include "hardware/dma.h"
+#endif
+
+#if TRANSFER_MODE == 2
+#include "hardware/pio.h"
+#include "shift_out.pio.h"
+#endif
 
 // Pin definitions (fixed by hardware)
 #define PIN_SIN_1  0  // Row select
@@ -52,6 +72,17 @@ static volatile bool buffer_ready = false;
 // Reception buffer
 static uint8_t recv_buffer[RECV_BUFFER_SIZE];
 static uint16_t recv_pos = 0;
+
+#if TRANSFER_MODE == 1
+// DMA + SPI variables
+static int dma_channel;
+#endif
+
+#if TRANSFER_MODE == 2
+// PIO variables
+static PIO pio = pio0;
+static uint sm = 0;
+#endif
 
 // Base64 decode table
 static const int8_t base64_decode_table[256] = {
@@ -106,10 +137,10 @@ static int base64_decode(const uint8_t* input, size_t input_len, uint8_t* output
     return output_len;
 }
 
+#if TRANSFER_MODE == 0
 /**
- * Fast shift out
+ * Mode 0: GPIO direct control
  * Shifts out 16 bits per panel (4 panels total)
- * Compatible with original code structure
  */
 static inline void shift_out_row(uint8_t row, uint8_t bit_plane) {
     gpio_put(PIN_STROBE, 1);
@@ -118,14 +149,13 @@ static inline void shift_out_row(uint8_t row, uint8_t bit_plane) {
     // For each panel (reversed order: panel 3, 2, 1, 0)
     for (int panel = PANELS - 1; panel >= 0; panel--) {
         // Get data for this panel and bit plane
-        // panel_line index: panel*2+0 for sin2, panel*2+1 for sin3
         uint16_t sin2_data = display_buffer[2 * (3 - panel) + 0][row][bit_plane];
         uint16_t sin3_data = display_buffer[2 * (3 - panel) + 1][row][bit_plane];
 
         // Shift out 16 bits
         for (int bit = 0; bit < COLS; bit++) {
             gpio_put(PIN_CLOCK, 0);
-            gpio_put(PIN_SIN_1, (row == bit) ? 1 : 0);  // Row select
+            gpio_put(PIN_SIN_1, (row == bit) ? 1 : 0);
             gpio_put(PIN_SIN_2, (sin2_data & 1) ? 1 : 0);
             gpio_put(PIN_SIN_3, (sin3_data & 1) ? 1 : 0);
             gpio_put(PIN_CLOCK, 1);
@@ -141,12 +171,99 @@ static inline void shift_out_row(uint8_t row, uint8_t bit_plane) {
     gpio_put(PIN_STROBE, 0);
     sleep_us(1);
 }
+#endif
+
+#if TRANSFER_MODE == 1
+/**
+ * Mode 1: DMA + SPI control
+ * Uses SPI with DMA for high-speed transfer
+ */
+static uint8_t spi_buffer[PANELS * COLS * 2];  // 2 bytes per bit (for 3 data lines)
+
+static inline void shift_out_row(uint8_t row, uint8_t bit_plane) {
+    gpio_put(PIN_STROBE, 1);
+    gpio_put(PIN_LATCH, 1);
+
+    // Prepare SPI buffer
+    int buf_idx = 0;
+    for (int panel = PANELS - 1; panel >= 0; panel--) {
+        uint16_t sin2_data = display_buffer[2 * (3 - panel) + 0][row][bit_plane];
+        uint16_t sin3_data = display_buffer[2 * (3 - panel) + 1][row][bit_plane];
+
+        for (int bit = 0; bit < COLS; bit++) {
+            uint8_t data_byte = 0;
+            data_byte |= ((row == bit) ? 1 : 0) << 0;  // SIN_1
+            data_byte |= ((sin2_data & 1) ? 1 : 0) << 1;  // SIN_2
+            data_byte |= ((sin3_data & 1) ? 1 : 0) << 2;  // SIN_3
+
+            spi_buffer[buf_idx++] = data_byte;
+
+            sin2_data >>= 1;
+            sin3_data >>= 1;
+        }
+    }
+
+    // Transfer via SPI with DMA
+    dma_channel_wait_for_finish_blocking(dma_channel);
+    dma_channel_set_read_addr(dma_channel, spi_buffer, false);
+    dma_channel_set_trans_count(dma_channel, buf_idx, true);
+    dma_channel_wait_for_finish_blocking(dma_channel);
+
+    // Latch and strobe
+    gpio_put(PIN_LATCH, 0);
+    sleep_us(1);
+    gpio_put(PIN_STROBE, 0);
+    sleep_us(1);
+}
+#endif
+
+#if TRANSFER_MODE == 2
+/**
+ * Mode 2: PIO control
+ * Uses PIO state machine for hardware-accelerated shift output
+ */
+static inline void shift_out_row(uint8_t row, uint8_t bit_plane) {
+    gpio_put(PIN_STROBE, 1);
+    gpio_put(PIN_LATCH, 1);
+
+    // For each panel (reversed order: panel 3, 2, 1, 0)
+    for (int panel = PANELS - 1; panel >= 0; panel--) {
+        uint16_t sin2_data = display_buffer[2 * (3 - panel) + 0][row][bit_plane];
+        uint16_t sin3_data = display_buffer[2 * (3 - panel) + 1][row][bit_plane];
+
+        // Shift out 16 bits via PIO
+        for (int bit = 0; bit < COLS; bit++) {
+            uint32_t pio_data = 0;
+            pio_data |= ((row == bit) ? 1 : 0) << 0;  // SIN_1
+            pio_data |= ((sin2_data & 1) ? 1 : 0) << 1;  // SIN_2
+            pio_data |= ((sin3_data & 1) ? 1 : 0) << 2;  // SIN_3
+
+            pio_sm_put_blocking(pio, sm, pio_data);
+
+            sin2_data >>= 1;
+            sin3_data >>= 1;
+        }
+    }
+
+    // Wait for PIO to finish
+    while (!pio_sm_is_tx_fifo_empty(pio, sm)) {
+        tight_loop_contents();
+    }
+
+    // Latch and strobe
+    gpio_put(PIN_LATCH, 0);
+    sleep_us(1);
+    gpio_put(PIN_STROBE, 0);
+    sleep_us(1);
+}
+#endif
 
 /**
  * Core 1: Display update with Bit-Angle Modulation (BAM)
  */
 void core1_display_task() {
-    // Initialize GPIO
+#if TRANSFER_MODE == 0
+    // Mode 0: GPIO direct control initialization
     gpio_init(PIN_SIN_1);
     gpio_init(PIN_SIN_2);
     gpio_init(PIN_SIN_3);
@@ -162,6 +279,41 @@ void core1_display_task() {
     gpio_set_dir(PIN_STROBE, GPIO_OUT);
 
     gpio_put(PIN_STROBE, 1);
+#endif
+
+#if TRANSFER_MODE == 1
+    // Mode 1: DMA + SPI initialization
+    gpio_init(PIN_LATCH);
+    gpio_init(PIN_STROBE);
+    gpio_set_dir(PIN_LATCH, GPIO_OUT);
+    gpio_set_dir(PIN_STROBE, GPIO_OUT);
+    gpio_put(PIN_STROBE, 1);
+
+    // Initialize SPI0 at 10 MHz
+    spi_init(spi0, 10 * 1000 * 1000);
+    gpio_set_function(PIN_SIN_2, GPIO_FUNC_SPI);  // MOSI (use for combined data)
+    gpio_set_function(PIN_CLOCK, GPIO_FUNC_SPI);  // SCK
+
+    // Setup DMA
+    dma_channel = dma_claim_unused_channel(true);
+    dma_channel_config c = dma_channel_get_default_config(dma_channel);
+    channel_config_set_transfer_data_size(&c, DMA_SIZE_8);
+    channel_config_set_dreq(&c, spi_get_dreq(spi0, true));
+    dma_channel_configure(dma_channel, &c, &spi_get_hw(spi0)->dr, spi_buffer, 0, false);
+#endif
+
+#if TRANSFER_MODE == 2
+    // Mode 2: PIO initialization
+    gpio_init(PIN_LATCH);
+    gpio_init(PIN_STROBE);
+    gpio_set_dir(PIN_LATCH, GPIO_OUT);
+    gpio_set_dir(PIN_STROBE, GPIO_OUT);
+    gpio_put(PIN_STROBE, 1);
+
+    // Load PIO program
+    uint offset = pio_add_program(pio, &shift_out_program);
+    shift_out_program_init(pio, sm, offset, PIN_SIN_1, PIN_CLOCK);
+#endif
 
     // Main display loop with BAM
     while (true) {
