@@ -52,8 +52,16 @@ USB CDC-ACM経由でBase64エンコードされたデータを送信します。
 
 ### 必要なもの
 - CMake 3.13以上
-- GCC ARM Embedded Toolchain
+- Ninja
+- GCC ARM Embedded Toolchain (`arm-none-eabi-gcc`)
 - Git
+
+### 環境構築（Ubuntu/Debian）
+
+```bash
+sudo apt update
+sudo apt install -y cmake ninja-build gcc-arm-none-eabi libnewlib-arm-none-eabi libstdc++-arm-none-eabi-newlib
+```
 
 ### リポジトリのクローン
 
@@ -73,11 +81,19 @@ git submodule update --init --recursive
 mkdir build
 cd build
 
-# CMake実行とビルド
-cmake ..
-make -j4
+# CMake実行（Ninja使用）
+cmake -G Ninja ..
+
+# ビルド
+ninja
 
 # 生成されたファイル: led_matrix_firmware.uf2
+```
+
+または、ワンライナーで：
+
+```bash
+mkdir -p build && cd build && cmake -G Ninja .. && ninja
 ```
 
 ### 書き込み
