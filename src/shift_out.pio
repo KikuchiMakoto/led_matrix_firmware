@@ -1,0 +1,61 @@
+; PIO program for fast shift register output to 74HC595
+; Outputs 3 data lines (SIN_1, SIN_2, SIN_3) with clock
+;
+; Pin mapping:
+;   OUT base + 0: SIN_1 (row select)
+;   OUT base + 1: SIN_2 (panel data)
+;   OUT base + 2: SIN_3 (panel data)
+;   SIDE base:    CLOCK
+;
+; Data format: 32-bit word
+;   bits [0]:     SIN_1 value (row select)
+;   bits [1]:     SIN_2 value
+;   bits [2]:     SIN_3 value
+;   bits [3-31]:  unused
+;
+; Autopull enabled, threshold 32
+
+.program shift_out
+.side_set 1 opt
+
+.wrap_target
+    pull block              ; Wait for data from FIFO
+    set x, 15               ; Loop counter for 16 bits
+
+bitloop:
+    out pins, 3 side 0 [1]  ; Output 3 data bits, clock low, delay 1 cycle
+    jmp x-- bitloop side 1 [1] ; Clock high, delay 1 cycle, decrement counter
+
+.wrap
+
+% c-sdk {
+static inline void shift_out_program_init(PIO pio, uint sm, uint offset, uint pin_base_out, uint pin_clock) {
+    pio_sm_config c = shift_out_program_get_default_config(offset);
+
+    // Set up output pins: SIN_1, SIN_2, SIN_3 (3 consecutive pins)
+    sm_config_set_out_pins(&c, pin_base_out, 3);
+
+    // Set up sideset pin: CLOCK
+    sm_config_set_sideset_pins(&c, pin_clock);
+
+    // Configure pins as outputs
+    pio_gpio_init(pio, pin_base_out);     // SIN_1
+    pio_gpio_init(pio, pin_base_out + 1); // SIN_2
+    pio_gpio_init(pio, pin_base_out + 2); // SIN_3
+    pio_gpio_init(pio, pin_clock);        // CLOCK
+
+    pio_sm_set_consecutive_pindirs(pio, sm, pin_base_out, 3, true);
+    pio_sm_set_consecutive_pindirs(pio, sm, pin_clock, 1, true);
+
+    // Shift out to the right, autopull enabled, threshold 32
+    sm_config_set_out_shift(&c, true, true, 32);
+
+    // Set clock divider for desired shift speed
+    // 125MHz / 2.5 = 50MHz
+    sm_config_set_clkdiv(&c, 2.5f);
+
+    // Initialize and start the state machine
+    pio_sm_init(pio, sm, offset, &c);
+    pio_sm_set_enabled(pio, sm, true);
+}
+%}

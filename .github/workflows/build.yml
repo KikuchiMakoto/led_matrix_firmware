@@ -1,0 +1,89 @@
+name: Build Firmware
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        transfer_mode: [0, 1, 2]
+        include:
+          - transfer_mode: 0
+            mode_name: "GPIO"
+          - transfer_mode: 1
+            mode_name: "DMA"
+          - transfer_mode: 2
+            mode_name: "PIO"
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y cmake ninja-build gcc-arm-none-eabi libnewlib-arm-none-eabi libstdc++-arm-none-eabi-newlib
+
+    - name: Build firmware (Mode ${{ matrix.transfer_mode }} - ${{ matrix.mode_name }})
+      run: |
+        mkdir build
+        cd build
+        cmake -G Ninja -DTRANSFER_MODE=${{ matrix.transfer_mode }} ..
+        ninja
+        ls -lh *.uf2
+
+    - name: Rename output file
+      run: |
+        cd build
+        mv led_matrix_firmware.uf2 led_matrix_firmware_mode${{ matrix.transfer_mode }}_${{ matrix.mode_name }}.uf2
+
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: led_matrix_firmware_mode${{ matrix.transfer_mode }}_${{ matrix.mode_name }}
+        path: build/led_matrix_firmware_mode${{ matrix.transfer_mode }}_${{ matrix.mode_name }}.uf2
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+
+    steps:
+    - name: Download all artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: artifacts
+
+    - name: Create Release
+      uses: softprops/action-gh-release@v1
+      with:
+        files: |
+          artifacts/led_matrix_firmware_mode0_GPIO/led_matrix_firmware_mode0_GPIO.uf2
+          artifacts/led_matrix_firmware_mode1_DMA/led_matrix_firmware_mode1_DMA.uf2
+          artifacts/led_matrix_firmware_mode2_PIO/led_matrix_firmware_mode2_PIO.uf2
+        body: |
+          ## LED Matrix Firmware for RP2040
+
+          3つの転送モードでビルドされたファームウェア：
+
+          - **led_matrix_firmware_mode0_GPIO.uf2**: GPIO直接制御（デフォルト、最も安定）
+          - **led_matrix_firmware_mode1_DMA.uf2**: DMA + SPI（CPU負荷軽減）
+          - **led_matrix_firmware_mode2_PIO.uf2**: PIO（最高速）
+
+          ### 使用方法
+          1. BOOTSELボタンを押しながらRP2040をUSB接続
+          2. いずれかの.uf2ファイルをRP2040のドライブにコピー
+          3. 自動的に再起動して動作開始
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
