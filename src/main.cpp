@@ -68,6 +68,14 @@ static volatile bool frame_ready = false;
 #define DEFAULT_BRIGHTNESS 255
 static volatile uint8_t brightness = DEFAULT_BRIGHTNESS;
 
+// Diagnostics must NEVER block the RX core: the host may keep the port
+// open without reading CDC TX. Unconditional Serial prints fill the TX
+// buffer, println blocks, Core0 stops draining RX, and the host hits
+// write timeout. Gate every print on TX buffer space.
+static inline bool dbg_can_write() {
+  return Serial.availableForWrite() > 64;
+}
+
 // Diagnostics (Core0 writes; loop1 writes dbg_rows only)
 static uint32_t dbg_ok = 0;
 static uint32_t dbg_err = 0;
@@ -126,14 +134,16 @@ static void on_packet(const uint8_t *raw, size_t len) {
   uint8_t bits = 0;
   if (proto_validate(raw, len, &bits) == 0) {
     dbg_err++;
-    Serial.println("-ERR validate");
+    if (dbg_can_write()) Serial.println("-ERR validate");
     return;
   }
   if (bits == PROTO_CMD_MODE) {
     if (raw[PROTO_HEADER_SIZE] == PROTO_CMD_BRIGHTNESS) {
       brightness = raw[PROTO_HEADER_SIZE + 1];
-      Serial.print("+OK brightness ");
-      Serial.println(brightness);
+      if (dbg_can_write()) {
+        Serial.print("+OK brightness ");
+        Serial.println(brightness);
+      }
     }
     dbg_ok++;
     return;
@@ -143,8 +153,8 @@ static void on_packet(const uint8_t *raw, size_t len) {
   stream_pending = back;
   frame_ready = true;
   dbg_ok++;
-  Serial.print("+OK ");
-  Serial.println(bits);
+  // NOTE: no per-packet +OK print. At video rates it floods TX and would
+  // stall Core0 when the host does not read. Watch +HB ok= instead.
 }
 
 static void drain_serial() {
@@ -217,12 +227,13 @@ void setup1() {
 void loop() {
   if (!dbg_boot_sent && millis() > 1500) {
     dbg_boot_sent = true;
-    Serial.println("+BOOT cobs8dma");
+    if (dbg_can_write()) Serial.println("+BOOT cobs8dma");
   }
   drain_serial();
   unsigned long now = millis();
   if (now - dbg_last_hb >= 2000) {
     dbg_last_hb = now;
+    if (!dbg_can_write()) return;
     Serial.print("+HB ok=");
     Serial.print(dbg_ok);
     Serial.print(" err=");
