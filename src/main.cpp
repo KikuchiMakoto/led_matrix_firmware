@@ -1,432 +1,273 @@
 /**
- * LED Matrix Firmware for RP2040
- * Supports 8-bit brightness with Bit-Angle Modulation (BAM)
- * Multiple transfer modes for performance comparison
+ * LED Matrix Firmware for RP2040 (Arduino framework, Earle Philhower core)
  *
- * Hardware: 74HC595 shift registers
- * Communication: USB CDC-ACM + Base64
+ * Protocol v2: Fixed 4B header + Raw payload + COBS + 0x00 delimiter.
+ *   header: [MAGIC 0x55][MODE N=1..8][LEN_L][LEN_H], LEN = N*256
+ *   payload: N planes x 256B, plane0=LSB first, each plane is
+ *            matrix_buffer[8][16] uint16LE (legacy layout).
+ * No Base64. No compression.
  *
- * Protocol:
- * - 256 bytes (base64 encoded): 1-bit mode (compatible)
- * - 2048 bytes (base64 encoded): 8-bit brightness mode
- *
- * Transfer modes:
- * - TRANSFER_MODE 0: GPIO direct control
- * - TRANSFER_MODE 1: DMA + SPI
- * - TRANSFER_MODE 2: PIO
+ * Core0 (setup/loop): USB CDC receive, COBS decode, header validate,
+ *   then EXPAND planes into a PIO-ready word stream (ping-pong buffer).
+ * Core1 (setup1/loop1): feed the word stream to PIO via DMA, STROBE
+ *   blanking for BAM timing, pointer swap at V-Sync boundary.
+ * LATCH pulse is generated inside the PIO program (no CPU involved).
+ * UF2 upload: 1200bps touch handled by Arduino USB stack (do nothing).
  */
 
-// Select transfer mode (0: GPIO, 1: DMA, 2: PIO)
-#ifndef TRANSFER_MODE
-#define TRANSFER_MODE 0
-#endif
-
-#include <stdio.h>
+#include <Arduino.h>
 #include <string.h>
-#include <stdlib.h>
-#include "pico/stdlib.h"
-#include "pico/multicore.h"
-#include "hardware/gpio.h"
 
-#if TRANSFER_MODE == 1
-#include "hardware/spi.h"
-#include "hardware/dma.h"
-#endif
-
-#if TRANSFER_MODE == 2
 #include "hardware/pio.h"
+#include "hardware/dma.h"
 #include "shift_out.pio.h"
-#endif
+
+#include "protocol.h"
+#include "cobs.h"
 
 // Pin definitions (fixed by hardware)
-#define PIN_SIN_1  0  // Row select
-#define PIN_SIN_2  1  // Panel data 1
-#define PIN_SIN_3  2  // Panel data 2
-#define PIN_CLOCK  3  // Shift clock
-#define PIN_LATCH  4  // Latch
-#define PIN_STROBE 5  // Strobe
+#define PIN_SIN_1 0  // Row select (PIO OUT)
+#define PIN_SIN_2 1  // Panel data 1 (PIO OUT)
+#define PIN_SIN_3 2  // Panel data 2 (PIO OUT)
+#define PIN_CLOCK 3  // Shift clock (PIO sideset)
+#define PIN_LATCH 4  // Latch (PIO SET, auto-pulsed per row)
+#define PIN_STROBE 5  // Strobe / OE, GPIO (LOW = display on)
 
 // Display dimensions
 #define ROWS 16
 #define COLS 16
 #define PANELS 4
-#define PANEL_LINES 8  // 4 panels × 2 lines (sin2, sin3)
+#define WORDS_PER_ROW (PANELS * COLS)  // 64 pixels, 1 word each
 
-// Brightness levels
-#define BRIGHTNESS_BITS 8
-#define BRIGHTNESS_LEVELS (1 << BRIGHTNESS_BITS)
+// BAM timing (tunable, verify on real LED)
+// LSB unit; plane p on-time = BAM_UNIT_US << p. Shift happens while
+// STROBE=HIGH (blanked), so LSB is never buried in shift time.
+// 8bit full cycle ~= 16 rows x (shift + 255*UNIT): UNIT=10 -> ~41ms
+// (24Hz flicker), UNIT=2 -> ~8.5ms (~118Hz, flicker-free target).
+#define BAM_UNIT_US 2
+// STROBE toggle + loop overhead added to EVERY plane window (~3us,
+// measured via rows/s counter). Subtract it so LSB weights stay linear.
+// Without this, plane0 (ideal 2us) would display ~5us (2.5x too bright),
+// lifting darks and flattening highlights by comparison.
+#define STROBE_OH_US 3
+#define BAM_MIN_ON_US 2
+// 1-bit mode fixed on-time per row
+#define BINARY_ON_US 400
 
-// Buffer sizes
-#define BUFFER_1BIT_SIZE  256   // 8 panel_lines × 16 cols × 2 bytes = 256 bytes
-#define BUFFER_8BIT_SIZE  2048  // 256 bytes × 8 bit planes = 2048 bytes
-#define RECV_BUFFER_SIZE  4096
-#define BASE64_BUFFER_SIZE 3072
+// PIO word stream, ping-pong: [buf][plane][row][pixel-word]
+// 2 x 8 x 16 x 64 x 4B = 64KB (RAM 264KB, plenty left)
+static uint32_t pio_stream[2][PROTO_MAX_BITS][ROWS][WORDS_PER_ROW];
+static uint8_t stream_bits[2] = {1, 1};
+static volatile uint8_t stream_front = 0;
+static volatile uint8_t stream_pending = 0;
+static volatile bool frame_ready = false;
 
-// Display buffer: [panel_line][col][bit_plane]
-// Compatible with original matrix_buffer[8][16] structure
-// bit_plane 0 = LSB, bit_plane 7 = MSB
-static uint16_t display_buffer[PANEL_LINES][COLS][BRIGHTNESS_BITS];
-static uint16_t display_buffer_temp[PANEL_LINES][COLS][BRIGHTNESS_BITS];
-static volatile bool buffer_ready = false;
+// Global brightness 0..255 applied to BAM on-times.
+// Default 255 (100%): tonal rendering is handled entirely by the
+// host-side gamma curve. Adjustable at runtime via brightness command.
+#define DEFAULT_BRIGHTNESS 255
+static volatile uint8_t brightness = DEFAULT_BRIGHTNESS;
 
-// Reception buffer
-static uint8_t recv_buffer[RECV_BUFFER_SIZE];
-static uint16_t recv_pos = 0;
+// Diagnostics (Core0 writes; loop1 writes dbg_rows only)
+static uint32_t dbg_ok = 0;
+static uint32_t dbg_err = 0;
+static uint32_t dbg_bytes = 0;
+static unsigned long dbg_last_hb = 0;
+static bool dbg_boot_sent = false;
+static volatile uint32_t dbg_rows = 0;
 
-#if TRANSFER_MODE == 1
-// DMA + SPI variables
-static int dma_channel;
-#endif
+// Receive ring (Core0 only)
+static uint8_t ring_buf[PROTO_RING_SIZE];
+static size_t ring_pos = 0;
 
-#if TRANSFER_MODE == 2
-// PIO variables
-static PIO pio = pio0;
-static uint sm = 0;
-#endif
+static PIO pio_inst = pio0;
+static uint pio_sm = 0;
+static uint pio_offset = 0;
+static int dma_ch = -1;
 
-// Base64 decode table
-static const int8_t base64_decode_table[256] = {
-    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,  // 0-15
-    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,  // 16-31
-    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,62,-1,-1,-1,63,  // 32-47
-    52,53,54,55,56,57,58,59,60,61,-1,-1,-1,-1,-1,-1,  // 48-63
-    -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,  // 64-79
-    15,16,17,18,19,20,21,22,23,24,25,-1,-1,-1,-1,-1,  // 80-95
-    -1,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,  // 96-111
-    41,42,43,44,45,46,47,48,49,50,51,-1,-1,-1,-1,-1,  // 112-127
-    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,  // 128-143
-    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,  // 144-159
-    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,  // 160-175
-    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,  // 176-191
-    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,  // 192-207
-    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,  // 208-223
-    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,  // 224-239
-    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1   // 240-255
-};
-
-/**
- * Base64 decoder
- * Returns: decoded length, or -1 on error
- */
-static int base64_decode(const uint8_t* input, size_t input_len, uint8_t* output) {
-    if (input_len % 4 != 0) return -1;
-
-    size_t output_len = 0;
-
-    for (size_t i = 0; i < input_len; i += 4) {
-        int8_t a = base64_decode_table[input[i]];
-        int8_t b = base64_decode_table[input[i + 1]];
-        int8_t c = base64_decode_table[input[i + 2]];
-        int8_t d = base64_decode_table[input[i + 3]];
-
-        if (a == -1 || b == -1) return -1;
-
-        output[output_len++] = (a << 2) | (b >> 4);
-
-        if (input[i + 2] != '=') {
-            if (c == -1) return -1;
-            output[output_len++] = (b << 4) | (c >> 2);
-        }
-
-        if (input[i + 3] != '=') {
-            if (d == -1) return -1;
-            output[output_len++] = (c << 6) | d;
-        }
-    }
-
-    return output_len;
-}
-
-#if TRANSFER_MODE == 0
-/**
- * Mode 0: GPIO direct control
- * Shifts out 16 bits per panel (4 panels total)
- */
-static inline void shift_out_row(uint8_t row, uint8_t bit_plane) {
-    gpio_put(PIN_STROBE, 1);
-    gpio_put(PIN_LATCH, 1);
-
-    // For each panel (reversed order: panel 3, 2, 1, 0)
-    for (int panel = PANELS - 1; panel >= 0; panel--) {
-        // Get data for this panel and bit plane
-        uint16_t sin2_data = display_buffer[2 * (3 - panel) + 0][row][bit_plane];
-        uint16_t sin3_data = display_buffer[2 * (3 - panel) + 1][row][bit_plane];
-
-        // Shift out 16 bits
+// Expand one validated packet into the back word-stream buffer.
+// Chain order (verified on real LED): first-shifted word travels farthest,
+// panel 3 is shifted first -> must carry the rightmost groups.
+// With LATCH auto-pulsed right after the row, outputs follow immediately.
+static void expand_packet(const uint8_t *payload, uint8_t bits, uint8_t back) {
+  const uint16_t *pl = (const uint16_t *)payload;  // [plane][line][col]
+  for (uint8_t p = 0; p < bits; p++) {
+    for (uint8_t r = 0; r < ROWS; r++) {
+      uint32_t *w = pio_stream[back][p][r];
+      int k = 0;
+      for (int panel = PANELS - 1; panel >= 0; panel--) {
+        uint16_t sin2 = pl[p * 128 + (2 * panel + 0) * 16 + r];
+        uint16_t sin3 = pl[p * 128 + (2 * panel + 1) * 16 + r];
         for (int bit = 0; bit < COLS; bit++) {
-            gpio_put(PIN_CLOCK, 0);
-            gpio_put(PIN_SIN_1, (row == bit) ? 1 : 0);
-            gpio_put(PIN_SIN_2, (sin2_data & 1) ? 1 : 0);
-            gpio_put(PIN_SIN_3, (sin3_data & 1) ? 1 : 0);
-            gpio_put(PIN_CLOCK, 1);
-
-            sin2_data >>= 1;
-            sin3_data >>= 1;
+          uint32_t word = 0;
+          if (r == (uint8_t)bit) word |= 1u << 0;
+          if (sin2 & 1u) word |= 1u << 1;
+          if (sin3 & 1u) word |= 1u << 2;
+          w[k++] = word;
+          sin2 >>= 1;
+          sin3 >>= 1;
         }
+      }
     }
-
-    // Latch and strobe
-    gpio_put(PIN_LATCH, 0);
-    sleep_us(1);
-    gpio_put(PIN_STROBE, 0);
-    sleep_us(1);
-}
-#endif
-
-#if TRANSFER_MODE == 1
-/**
- * Mode 1: DMA + SPI control
- * Uses SPI with DMA for high-speed transfer
- */
-static uint8_t spi_buffer[PANELS * COLS * 2];  // 2 bytes per bit (for 3 data lines)
-
-static inline void shift_out_row(uint8_t row, uint8_t bit_plane) {
-    gpio_put(PIN_STROBE, 1);
-    gpio_put(PIN_LATCH, 1);
-
-    // Prepare SPI buffer
-    int buf_idx = 0;
-    for (int panel = PANELS - 1; panel >= 0; panel--) {
-        uint16_t sin2_data = display_buffer[2 * (3 - panel) + 0][row][bit_plane];
-        uint16_t sin3_data = display_buffer[2 * (3 - panel) + 1][row][bit_plane];
-
-        for (int bit = 0; bit < COLS; bit++) {
-            uint8_t data_byte = 0;
-            data_byte |= ((row == bit) ? 1 : 0) << 0;  // SIN_1
-            data_byte |= ((sin2_data & 1) ? 1 : 0) << 1;  // SIN_2
-            data_byte |= ((sin3_data & 1) ? 1 : 0) << 2;  // SIN_3
-
-            spi_buffer[buf_idx++] = data_byte;
-
-            sin2_data >>= 1;
-            sin3_data >>= 1;
-        }
-    }
-
-    // Transfer via SPI with DMA
-    dma_channel_wait_for_finish_blocking(dma_channel);
-    dma_channel_set_read_addr(dma_channel, spi_buffer, false);
-    dma_channel_set_trans_count(dma_channel, buf_idx, true);
-    dma_channel_wait_for_finish_blocking(dma_channel);
-
-    // Latch and strobe
-    gpio_put(PIN_LATCH, 0);
-    sleep_us(1);
-    gpio_put(PIN_STROBE, 0);
-    sleep_us(1);
-}
-#endif
-
-#if TRANSFER_MODE == 2
-/**
- * Mode 2: PIO control
- * Uses PIO state machine for hardware-accelerated shift output
- */
-static inline void shift_out_row(uint8_t row, uint8_t bit_plane) {
-    gpio_put(PIN_STROBE, 1);
-    gpio_put(PIN_LATCH, 1);
-
-    // For each panel (reversed order: panel 3, 2, 1, 0)
-    for (int panel = PANELS - 1; panel >= 0; panel--) {
-        uint16_t sin2_data = display_buffer[2 * (3 - panel) + 0][row][bit_plane];
-        uint16_t sin3_data = display_buffer[2 * (3 - panel) + 1][row][bit_plane];
-
-        // Shift out 16 bits via PIO
-        for (int bit = 0; bit < COLS; bit++) {
-            uint32_t pio_data = 0;
-            pio_data |= ((row == bit) ? 1 : 0) << 0;  // SIN_1
-            pio_data |= ((sin2_data & 1) ? 1 : 0) << 1;  // SIN_2
-            pio_data |= ((sin3_data & 1) ? 1 : 0) << 2;  // SIN_3
-
-            pio_sm_put_blocking(pio, sm, pio_data);
-
-            sin2_data >>= 1;
-            sin3_data >>= 1;
-        }
-    }
-
-    // Wait for PIO to finish
-    while (!pio_sm_is_tx_fifo_empty(pio, sm)) {
-        tight_loop_contents();
-    }
-
-    // Latch and strobe
-    gpio_put(PIN_LATCH, 0);
-    sleep_us(1);
-    gpio_put(PIN_STROBE, 0);
-    sleep_us(1);
-}
-#endif
-
-/**
- * Core 1: Display update with Bit-Angle Modulation (BAM)
- */
-void core1_display_task() {
-#if TRANSFER_MODE == 0
-    // Mode 0: GPIO direct control initialization
-    gpio_init(PIN_SIN_1);
-    gpio_init(PIN_SIN_2);
-    gpio_init(PIN_SIN_3);
-    gpio_init(PIN_CLOCK);
-    gpio_init(PIN_LATCH);
-    gpio_init(PIN_STROBE);
-
-    gpio_set_dir(PIN_SIN_1, GPIO_OUT);
-    gpio_set_dir(PIN_SIN_2, GPIO_OUT);
-    gpio_set_dir(PIN_SIN_3, GPIO_OUT);
-    gpio_set_dir(PIN_CLOCK, GPIO_OUT);
-    gpio_set_dir(PIN_LATCH, GPIO_OUT);
-    gpio_set_dir(PIN_STROBE, GPIO_OUT);
-
-    gpio_put(PIN_STROBE, 1);
-#endif
-
-#if TRANSFER_MODE == 1
-    // Mode 1: DMA + SPI initialization
-    gpio_init(PIN_LATCH);
-    gpio_init(PIN_STROBE);
-    gpio_set_dir(PIN_LATCH, GPIO_OUT);
-    gpio_set_dir(PIN_STROBE, GPIO_OUT);
-    gpio_put(PIN_STROBE, 1);
-
-    // Initialize SPI0 at 10 MHz
-    spi_init(spi0, 10 * 1000 * 1000);
-    gpio_set_function(PIN_SIN_2, GPIO_FUNC_SPI);  // MOSI (use for combined data)
-    gpio_set_function(PIN_CLOCK, GPIO_FUNC_SPI);  // SCK
-
-    // Setup DMA
-    dma_channel = dma_claim_unused_channel(true);
-    dma_channel_config c = dma_channel_get_default_config(dma_channel);
-    channel_config_set_transfer_data_size(&c, DMA_SIZE_8);
-    channel_config_set_dreq(&c, spi_get_dreq(spi0, true));
-    dma_channel_configure(dma_channel, &c, &spi_get_hw(spi0)->dr, spi_buffer, 0, false);
-#endif
-
-#if TRANSFER_MODE == 2
-    // Mode 2: PIO initialization
-    gpio_init(PIN_LATCH);
-    gpio_init(PIN_STROBE);
-    gpio_set_dir(PIN_LATCH, GPIO_OUT);
-    gpio_set_dir(PIN_STROBE, GPIO_OUT);
-    gpio_put(PIN_STROBE, 1);
-
-    // Load PIO program
-    uint offset = pio_add_program(pio, &shift_out_program);
-    shift_out_program_init(pio, sm, offset, PIN_SIN_1, PIN_CLOCK);
-#endif
-
-    // Main display loop with BAM
-    while (true) {
-        // Update display buffer if new data is ready
-        if (buffer_ready) {
-            memcpy(display_buffer, display_buffer_temp, sizeof(display_buffer));
-            buffer_ready = false;
-        }
-
-        // Bit-Angle Modulation: display each bit plane with weighted time
-        for (uint8_t bit_plane = 0; bit_plane < BRIGHTNESS_BITS; bit_plane++) {
-            // Display time proportional to bit weight: 2^bit_plane
-            uint32_t display_time = (1 << bit_plane);
-
-            for (uint8_t row = 0; row < ROWS; row++) {
-                shift_out_row(row, bit_plane);
-
-                // Wait proportional to bit weight
-                sleep_us(display_time);
-            }
-        }
-    }
+  }
+  stream_bits[back] = bits;
 }
 
-/**
- * Process received data (base64 encoded)
- */
-static void process_received_data(const uint8_t* data, size_t len) {
-    static uint8_t decoded_buffer[BASE64_BUFFER_SIZE];
-
-    // Decode base64
-    int decoded_len = base64_decode(data, len, decoded_buffer);
-
-    if (decoded_len == BUFFER_1BIT_SIZE) {
-        // 1-bit mode: 256 bytes (compatible mode)
-        // Data format matches original: matrix_buffer[8][16] as uint16_t
-        // Copy directly and expand to all bit planes
-        uint16_t* src = (uint16_t*)decoded_buffer;
-
-        for (int panel_line = 0; panel_line < PANEL_LINES; panel_line++) {
-            for (int col = 0; col < COLS; col++) {
-                uint16_t data_1bit = src[panel_line * COLS + col];
-
-                // Expand 1-bit to all bit planes (0x0000 or 0xFFFF)
-                for (int bit_plane = 0; bit_plane < BRIGHTNESS_BITS; bit_plane++) {
-                    display_buffer_temp[panel_line][col][bit_plane] = data_1bit;
-                }
-            }
-        }
-        buffer_ready = true;
-    }
-    else if (decoded_len == BUFFER_8BIT_SIZE) {
-        // 8-bit mode: 2048 bytes
-        // Data format: 8 bit planes of matrix_buffer[8][16]
-        // Each bit plane is 256 bytes (128 uint16_t)
-        uint16_t* src = (uint16_t*)decoded_buffer;
-
-        for (int bit_plane = 0; bit_plane < BRIGHTNESS_BITS; bit_plane++) {
-            for (int panel_line = 0; panel_line < PANEL_LINES; panel_line++) {
-                for (int col = 0; col < COLS; col++) {
-                    int idx = bit_plane * (PANEL_LINES * COLS) + panel_line * COLS + col;
-                    display_buffer_temp[panel_line][col][bit_plane] = src[idx];
-                }
-            }
-        }
-        buffer_ready = true;
-    }
-    // else: invalid length, ignore
+// Scale an on-time by global brightness (0..255).
+static inline uint32_t apply_brightness(uint32_t on_us) {
+  uint8_t br = brightness;
+  if (br == 255) return on_us;
+  if (br == 0) return 0;
+  uint32_t scaled = (on_us * br) / 255;
+  return (scaled > 0) ? scaled : 1;
 }
 
-/**
- * Core 0: USB reception and data processing
- */
-int main() {
-    // Initialize USB CDC
-    stdio_init_all();
-
-    // Wait for USB connection
-    sleep_ms(3000);
-
-    // Clear buffers
-    memset(display_buffer, 0, sizeof(display_buffer));
-    memset(display_buffer_temp, 0, sizeof(display_buffer_temp));
-    memset(recv_buffer, 0, sizeof(recv_buffer));
-
-    // Start display task on Core 1
-    multicore_launch_core1(core1_display_task);
-
-    // Main reception loop
-    while (true) {
-        int c = getchar_timeout_us(1000);
-
-        if (c != PICO_ERROR_TIMEOUT) {
-            if (c == '\r') {
-                // Ignore CR
-                continue;
-            }
-            else if (c == '\n') {
-                // End of frame
-                if (recv_pos > 0) {
-                    process_received_data(recv_buffer, recv_pos);
-                    recv_pos = 0;
-                    memset(recv_buffer, 0, sizeof(recv_buffer));
-                }
-            }
-            else {
-                // Store character
-                if (recv_pos < RECV_BUFFER_SIZE - 1) {
-                    recv_buffer[recv_pos++] = (uint8_t)c;
-                }
-            }
-        }
+static void on_packet(const uint8_t *raw, size_t len) {
+  uint8_t bits = 0;
+  if (proto_validate(raw, len, &bits) == 0) {
+    dbg_err++;
+    Serial.println("-ERR validate");
+    return;
+  }
+  if (bits == PROTO_CMD_MODE) {
+    if (raw[PROTO_HEADER_SIZE] == PROTO_CMD_BRIGHTNESS) {
+      brightness = raw[PROTO_HEADER_SIZE + 1];
+      Serial.print("+OK brightness ");
+      Serial.println(brightness);
     }
+    dbg_ok++;
+    return;
+  }
+  uint8_t back = 1 - stream_front;  // snapshot; swap happens only at V-Sync
+  expand_packet(raw + PROTO_HEADER_SIZE, bits, back);
+  stream_pending = back;
+  frame_ready = true;
+  dbg_ok++;
+  Serial.print("+OK ");
+  Serial.println(bits);
+}
 
-    return 0;
+static void drain_serial() {
+  while (Serial.available() > 0) {
+    int c = Serial.read();
+    if (c < 0) break;
+    uint8_t b = (uint8_t)c;
+    if (b == PROTO_DELIMITER) {
+      if (ring_pos > 0) {
+        size_t decoded = cobs_decode_inplace(ring_buf, ring_pos);
+        if (decoded > 0) on_packet(ring_buf, decoded);
+        ring_pos = 0;
+      }
+    } else {
+      if (ring_pos < sizeof(ring_buf)) {
+        ring_buf[ring_pos++] = b;
+        dbg_bytes++;
+      } else {
+        ring_pos = 0;  // overflow: drop frame, resync at next 0x00
+      }
+    }
+  }
+}
+
+// Show one row: DMA 64 words into PIO, wait until PIO latched them,
+// then STROBE on for the caller's on-time (caller manages blanking).
+static inline void show_row_dma(uint8_t plane, uint8_t row) {
+  digitalWrite(PIN_STROBE, HIGH);  // blank during shift
+  dma_channel_set_read_addr(dma_ch, pio_stream[stream_front][plane][row], true);
+  dma_channel_wait_for_finish_blocking(dma_ch);
+  // DMA done = words in FIFO; wait until PIO consumed + auto-latched.
+  // The SM stalls on the `pull` instruction (program index 2, see the
+  // pioasm disassembly) once all 64 words are consumed and LATCH fired.
+  // NOTE: poll for the pull address, NOT the wrap target: the wrap target
+  // is passed transiently and is unobservable at fast PIO clocks.
+  while (!pio_sm_is_tx_fifo_empty(pio_inst, pio_sm)) {
+    tight_loop_contents();
+  }
+  while (pio_sm_get_pc(pio_inst, pio_sm) != (pio_offset + 2)) {
+    tight_loop_contents();
+  }
+  digitalWrite(PIN_STROBE, LOW);  // display latched row
+}
+
+void setup() {
+  Serial.begin(921600);
+  memset(pio_stream, 0, sizeof(pio_stream));
+  memset(ring_buf, 0, sizeof(ring_buf));
+}
+
+void setup1() {
+  pinMode(PIN_STROBE, OUTPUT);
+  digitalWrite(PIN_STROBE, HIGH);
+  // NOTE: LATCH is PIO-driven (SET pin); do not pinMode it as GPIO.
+
+  pio_offset = pio_add_program(pio_inst, &shift_out_program);
+  shift_out_program_init(pio_inst, pio_sm, pio_offset, PIN_SIN_1, PIN_CLOCK,
+                         PIN_LATCH);
+
+  dma_ch = dma_claim_unused_channel(true);
+  dma_channel_config cfg = dma_channel_get_default_config(dma_ch);
+  channel_config_set_transfer_data_size(&cfg, DMA_SIZE_32);
+  channel_config_set_read_increment(&cfg, true);
+  channel_config_set_write_increment(&cfg, false);
+  channel_config_set_dreq(&cfg, pio_get_dreq(pio_inst, pio_sm, true));
+  dma_channel_configure(dma_ch, &cfg, &pio_inst->txf[pio_sm], NULL,
+                        WORDS_PER_ROW, false);
+}
+
+void loop() {
+  if (!dbg_boot_sent && millis() > 1500) {
+    dbg_boot_sent = true;
+    Serial.println("+BOOT cobs8dma");
+  }
+  drain_serial();
+  unsigned long now = millis();
+  if (now - dbg_last_hb >= 2000) {
+    dbg_last_hb = now;
+    Serial.print("+HB ok=");
+    Serial.print(dbg_ok);
+    Serial.print(" err=");
+    Serial.print(dbg_err);
+    Serial.print(" rx=");
+    Serial.print(dbg_bytes);
+    Serial.print(" bits=");
+    Serial.print(stream_bits[stream_front]);
+    Serial.print(" rows=");
+    Serial.println((unsigned long)dbg_rows);
+  }
+}
+
+void loop1() {
+  // V-Sync swap: pointer flip only, at BAM cycle boundary
+  if (frame_ready) {
+    uint8_t n = stream_bits[stream_pending];
+    if (n >= PROTO_MIN_BITS && n <= PROTO_MAX_BITS) {
+      stream_front = stream_pending;
+    }
+    frame_ready = false;
+  }
+
+  uint8_t n = stream_bits[stream_front];
+  if (n < PROTO_MIN_BITS || n > PROTO_MAX_BITS) n = 1;
+
+  // 1-bit mode: always maximum brightness, bypasses brightness scaling.
+  if (n == 1) {
+    for (uint8_t row = 0; row < ROWS; row++) {
+      show_row_dma(0, row);
+      delayMicroseconds(BINARY_ON_US);
+      dbg_rows++;
+    }
+    return;
+  }
+
+  for (uint8_t plane = 0; plane < n; plane++) {
+    uint32_t ideal = (uint32_t)BAM_UNIT_US << plane;
+    uint32_t on_us =
+        (ideal > STROBE_OH_US) ? (ideal - STROBE_OH_US) : BAM_MIN_ON_US;
+    on_us = apply_brightness(on_us);
+    for (uint8_t row = 0; row < ROWS; row++) {
+      show_row_dma(0 + plane, row);
+      delayMicroseconds(on_us);
+      dbg_rows++;
+    }
+  }
 }

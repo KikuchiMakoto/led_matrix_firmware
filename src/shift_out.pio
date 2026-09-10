@@ -1,35 +1,46 @@
 ; PIO program for fast shift register output to 74HC595
-; Outputs 3 data lines (SIN_1, SIN_2, SIN_3) with clock
+; Outputs 3 data lines (SIN_1, SIN_2, SIN_3) with clock,
+; plus automatic LATCH pulse after each row.
 ;
 ; Pin mapping:
 ;   OUT base + 0: SIN_1 (row select)
 ;   OUT base + 1: SIN_2 (panel data)
 ;   OUT base + 2: SIN_3 (panel data)
 ;   SIDE base:    CLOCK
+;   SET base:     LATCH (storage-register clock, rising edge latches)
 ;
-; Data format: 32-bit word
+; Data format: 32-bit word per PIXEL (1:1 FIFO consumption, autopull OFF)
 ;   bits [0]:     SIN_1 value (row select)
 ;   bits [1]:     SIN_2 value
 ;   bits [2]:     SIN_3 value
 ;   bits [3-31]:  unused
 ;
-; Autopull enabled, threshold 32
+; CPU/DMA pushes exactly 64 words per row (4 panels x 16 bits, panel 3
+; first). After the 64th pixel the SM pulses LATCH HIGH by itself, so the
+; freshly shifted row appears with zero lag. STROBE/OE stays on GPIO.
 
 .program shift_out
 .side_set 1 opt
 
 .wrap_target
-    pull block              ; Wait for data from FIFO
-    set x, 15               ; Loop counter for 16 bits
-
-bitloop:
-    out pins, 3 side 0 [1]  ; Output 3 data bits, clock low, delay 1 cycle
-    jmp x-- bitloop side 1 [1] ; Clock high, delay 1 cycle, decrement counter
-
+    set y, 1                ; 2 halves x 32 pixels = 64 pixels per row
+                            ; (SET immediate is 5 bits, max 31)
+half:
+    set x, 31
+pixel:
+    pull block              ; one pixel word from FIFO (stalls when empty)
+    out pins, 3 side 0 [1]  ; output data bits, clock low
+    nop side 1 [1]          ; clock high: 595 shifts in
+    jmp x-- pixel           ; next pixel
+    jmp y-- half            ; second half
+    set pins, 1 [1]         ; LATCH rising edge: storage <- shift register
+    set pins, 0 [1]         ; LATCH idle low
 .wrap
 
 % c-sdk {
-static inline void shift_out_program_init(PIO pio, uint sm, uint offset, uint pin_base_out, uint pin_clock) {
+static inline void shift_out_program_init(PIO pio, uint sm, uint offset,
+                                          uint pin_base_out, uint pin_clock,
+                                          uint pin_latch) {
     pio_sm_config c = shift_out_program_get_default_config(offset);
 
     // Set up output pins: SIN_1, SIN_2, SIN_3 (3 consecutive pins)
@@ -38,20 +49,27 @@ static inline void shift_out_program_init(PIO pio, uint sm, uint offset, uint pi
     // Set up sideset pin: CLOCK
     sm_config_set_sideset_pins(&c, pin_clock);
 
-    // Configure pins as outputs
+    // Set up SET pin: LATCH
+    sm_config_set_set_pins(&c, pin_latch, 1);
+
+    // Configure pins as PIO outputs
     pio_gpio_init(pio, pin_base_out);     // SIN_1
     pio_gpio_init(pio, pin_base_out + 1); // SIN_2
     pio_gpio_init(pio, pin_base_out + 2); // SIN_3
     pio_gpio_init(pio, pin_clock);        // CLOCK
+    pio_gpio_init(pio, pin_latch);        // LATCH
 
     pio_sm_set_consecutive_pindirs(pio, sm, pin_base_out, 3, true);
     pio_sm_set_consecutive_pindirs(pio, sm, pin_clock, 1, true);
+    pio_sm_set_consecutive_pindirs(pio, sm, pin_latch, 1, true);
 
-    // Shift out to the right, autopull enabled, threshold 32
-    sm_config_set_out_shift(&c, true, true, 32);
+    // Shift out to the right, autopull DISABLED (explicit pull per pixel)
+    sm_config_set_out_shift(&c, true, false, 32);
 
     // Set clock divider for desired shift speed
-    // 125MHz / 2.5 = 50MHz
+    // 125MHz / 2.5 = 50MHz PIO clock -> ~12.5MHz pixel rate.
+    // Display verified at slow clock; the earlier fast-clock garbage was
+    // the FIFO-granularity bug (now fixed 1:1), not signal integrity.
     sm_config_set_clkdiv(&c, 2.5f);
 
     // Initialize and start the state machine

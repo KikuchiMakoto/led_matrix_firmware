@@ -2,7 +2,7 @@ name: Build Firmware
 
 permissions:
   contents: write
-  
+
 on:
   push:
     branches:
@@ -16,46 +16,30 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        transfer_mode: [0, 1, 2]
-        include:
-          - transfer_mode: 0
-            mode_name: "GPIO"
-          - transfer_mode: 1
-            mode_name: "DMA"
-          - transfer_mode: 2
-            mode_name: "PIO"
 
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
       with:
-        submodules: recursive
+        python-version: '3.11'
 
-    - name: Install dependencies
+    - name: Install PlatformIO
       run: |
-        sudo apt-get update
-        sudo apt-get install -y cmake ninja-build gcc-arm-none-eabi libnewlib-arm-none-eabi libstdc++-arm-none-eabi-newlib
+        pip install platformio
 
-    - name: Build firmware (Mode ${{ matrix.transfer_mode }} - ${{ matrix.mode_name }})
+    - name: Build firmware (Arduino, waveshare_rp2040_zero)
       run: |
-        mkdir build
-        cd build
-        cmake -G Ninja -DTRANSFER_MODE=${{ matrix.transfer_mode }} ..
-        ninja
-        ls -lh *.uf2
+        pio run -e waveshare_rp2040_zero
+        ls -lh .pio/build/waveshare_rp2040_zero/firmware.uf2
 
-    - name: Rename output file
-      run: |
-        cd build
-        mv led_matrix_firmware.uf2 led_matrix_firmware_mode${{ matrix.transfer_mode }}_${{ matrix.mode_name }}.uf2
-
-    - name: Upload artifacts
+    - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
-        name: led_matrix_firmware_mode${{ matrix.transfer_mode }}_${{ matrix.mode_name }}
-        path: build/led_matrix_firmware_mode${{ matrix.transfer_mode }}_${{ matrix.mode_name }}.uf2
+        name: led_matrix_firmware_arduino
+        path: .pio/build/waveshare_rp2040_zero/firmware.uf2
 
   release:
     needs: build
@@ -72,21 +56,17 @@ jobs:
       uses: softprops/action-gh-release@v1
       with:
         files: |
-          artifacts/led_matrix_firmware_mode0_GPIO/led_matrix_firmware_mode0_GPIO.uf2
-          artifacts/led_matrix_firmware_mode1_DMA/led_matrix_firmware_mode1_DMA.uf2
-          artifacts/led_matrix_firmware_mode2_PIO/led_matrix_firmware_mode2_PIO.uf2
+          artifacts/led_matrix_firmware_arduino/firmware.uf2
         body: |
-          ## LED Matrix Firmware for RP2040
+          ## LED Matrix Firmware for RP2040 (Arduino)
 
-          3つの転送モードでビルドされたファームウェア：
+          Arduino (Earle Philhower core) + PIO BAM firmware:
 
-          - **led_matrix_firmware_mode0_GPIO.uf2**: GPIO直接制御（デフォルト、最も安定）
-          - **led_matrix_firmware_mode1_DMA.uf2**: DMA + SPI（CPU負荷軽減）
-          - **led_matrix_firmware_mode2_PIO.uf2**: PIO（最高速）
+          - **firmware.uf2**: COBS binary protocol (MODE 1..6bit), PIO shift-out
+          - 1200bps touch -> UF2 upload mode (no BOOTSEL press needed)
 
-          ### 使用方法
-          1. BOOTSELボタンを押しながらRP2040をUSB接続
-          2. いずれかの.uf2ファイルをRP2040のドライブにコピー
-          3. 自動的に再起動して動作開始
+          ### Usage
+          1. Copy `firmware.uf2` to the RPI-RP2 drive
+          2. Board reboots and enumerates as USB CDC (`/dev/ttyACM0`)
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

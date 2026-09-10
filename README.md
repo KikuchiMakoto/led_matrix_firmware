@@ -1,31 +1,20 @@
-# LED Matrix Firmware for RP2040
+# LED Matrix Firmware for RP2040 (Arduino)
 
-RP2040専用のLEDマトリクスファームウェアです。74HC595シフトレジスタを使用したLEDマトリクス表示に対応し、8bit輝度制御をサポートしています。
+RP2040専用のLEDマトリクスファームウェアです。Arduinoフレームワーク（Earle Philhower版 arduino-pico）ベースで、74HC595シフトレジスタを使用したLEDマトリクス表示に対応し、最大6bit輝度制御をサポートしています。
 
 ## 特徴
 
-- **8bit輝度対応**: Bit-Angle Modulation (BAM)による256段階の輝度制御
-- **3つの転送モード**: GPIO直接制御、DMA+SPI、PIOによる高速化オプション
-- **互換性**: 従来の1bitモードとの後方互換性を維持
-- **マルチコア**: RP2040の2コアを活用（Core0: データ受信、Core1: 表示更新）
-- **USB CDC-ACM**: Base64エンコードされたデータをUSB経由で受信
+- **最大6bit輝度対応**: Bit-Angle Modulation (BAM)による最大64段階の輝度制御（1〜6bit可変）
+- **PIO高速シフト**: PIOステートマシンによるハードウェアシフト出力＋STROBEブランキングでジッター排除
+- **COBSバイナリ通信**: Base64を廃止し、固定4Bヘッダ＋COBS＋0x00区切り（オーバーヘッド約0.5%）
+- **マルチコア**: RP2040の2コアを活用（Core0: データ受信、Core1: 表示更新、V-Syncダブルバッファ）
+- **USB CDC-ACM**: 1200bps touchでUF2書き込みモードへ自動遷移（BOOTSELボタン不要）
 
-## 転送モード
+## 転送エンジン
 
-### Mode 0: GPIO直接制御（デフォルト）
-- `gpio_put()`による直接制御
-- シンプルで確実
-- 最も基本的な実装
-
-### Mode 1: DMA + SPI
-- SPIペリフェラルとDMAを使用
-- CPU負荷を軽減
-- DMAによる自動転送
-
-### Mode 2: PIO
-- Programmable I/Oによるハードウェアアクセラレーション
-- 最も高速
-- PIOステートマシンで並列処理
+- PIOステートマシンによるシフト出力（SIN_1/SIN_2/SIN_3＋CLOCK sideset）
+- PIOクロックは10MHz起点、配線が短いため15〜20MHzまで引き上げ可能（実機で調整）
+- シフト中はSTROBE=HIGH（ブランキング）でLSB埋没を防止
 
 ## ハードウェア
 
@@ -43,139 +32,75 @@ RP2040専用のLEDマトリクスファームウェアです。74HC595シフト�
 | GPIO 4 | LATCH | ラッチ信号 |
 | GPIO 5 | STROBE | ストローブ信号 |
 
-## 通信プロトコル
+## 通信プロトコル v2（COBS、Base64廃止）
 
 ### データフォーマット
-USB CDC-ACM経由でBase64エンコードされたデータを送信します。各フレームは改行文字（`\n`）で終了します。
+USB CDC-ACM経由でバイナリフレームを送信します。各フレームは `COBS(ヘッダ4B＋ペイロード)＋0x00` です。
+
+```
+[0] MAGIC = 0x55
+[1] MODE  = ビット深度 N (0x01〜0x06)
+[2..3] PAYLOAD_LEN = N*256 (uint16 LE)
+[4..] ペイロード: Nプレーン × 256B（各プレーンはmatrix_buffer[8][16] uint16LE、plane0=LSB先頭）
+```
 
 ### 動作モード
 
-#### 1bitモード（互換モード）
-- **データサイズ**: 256 bytes（Base64デコード後）
-- **用途**: 従来のON/OFF表示（互換性維持）
-- **動作**: 各ビットは0x0000または0xFFFFに展開され、全ビットプレーンで表示
+#### 1bitモード（N=1、ペイロード256B）
+- **用途**: ON/OFF表示（Dashboardモードの第一目標）
+- 固定点灯時間で表示
 
-#### 8bitモード（輝度対応）
-- **データサイズ**: 2048 bytes（Base64デコード後）
-- **用途**: 256段階の輝度制御
-- **データ構造**: 8つのビットプレーン × 256 bytes
-  - 各ビットプレーンは元のmatrix_buffer[8][16]形式（uint16_t）
+#### グレースケールモード（N=2〜6、ペイロード512〜1536B）
+- **用途**: 4〜64段階の輝度制御、BAM表示
+- 推奨: 60fpsは6bit、120fpsは4〜6bit
 
 ### エラー処理
-- 256 bytes、2048 bytes以外のデータは無視されます
-- Base64デコードエラー時もデータは無視されます
+- MAGIC/MODE/LENの3点照合に失敗したパケットは破棄されます
+- 次の `0x00` で即再同期します
 
-## ビルド方法
+## ビルド方法（PlatformIO＋Arduino）
 
 ### 必要なもの
-- CMake 3.13以上
-- Ninja
-- GCC ARM Embedded Toolchain (`arm-none-eabi-gcc`)
-- Git
-
-### 環境構築（Ubuntu/Debian）
-
-```bash
-sudo apt update
-sudo apt install -y cmake ninja-build gcc-arm-none-eabi libnewlib-arm-none-eabi libstdc++-arm-none-eabi-newlib
-```
-
-### リポジトリのクローン
-
-```bash
-# リポジトリをクローン
-git clone <repository-url>
-cd LED_Matrix_firmware_K00798
-
-# サブモジュール（Pico SDK）を初期化
-git submodule update --init --recursive
-```
+- Python 3.11以上
+- PlatformIO (`pip install platformio`)
 
 ### ビルド
 
-#### デフォルト（GPIO直接制御）
-
 ```bash
-mkdir build && cd build
-cmake -G Ninja ..
-ninja
+pio run -e waveshare_rp2040_zero
 ```
 
-#### 転送モードを指定してビルド
-
-```bash
-mkdir build && cd build
-
-# Mode 0: GPIO直接制御（デフォルト）
-cmake -G Ninja -DTRANSFER_MODE=0 ..
-ninja
-
-# Mode 1: DMA + SPI
-cmake -G Ninja -DTRANSFER_MODE=1 ..
-ninja
-
-# Mode 2: PIO
-cmake -G Ninja -DTRANSFER_MODE=2 ..
-ninja
-```
-
-生成されたファイル: `led_matrix_firmware.uf2`
-
-#### ワンライナー
-
-```bash
-# GPIO mode (default)
-mkdir -p build && cd build && cmake -G Ninja .. && ninja
-
-# DMA mode
-mkdir -p build && cd build && cmake -G Ninja -DTRANSFER_MODE=1 .. && ninja
-
-# PIO mode
-mkdir -p build && cd build && cmake -G Ninja -DTRANSFER_MODE=2 .. && ninja
-```
+生成されたファイル: `.pio/build/waveshare_rp2040_zero/firmware.uf2`
 
 ### 書き込み
 
 ```bash
-# RP2040をBOOTSELモードで接続
-# （BOOTSELボタンを押しながらUSB接続）
+# 方法A: 1200bps touchで自動的にUF2モードへ（Arduinoファーム動作中に有効）
+python3 -c "import serial; s=serial.Serial('/dev/ttyACM0',1200); s.close()"
 
-# .uf2ファイルをRP2040のマスストレージにコピー
-cp led_matrix_firmware.uf2 /media/$USER/RPI-RP2/
+# 方法B: BOOTSELボタンを押しながらUSB接続
+
+# RPI-RP2ドライブにコピー（自動再起動）
+cp .pio/build/waveshare_rp2040_zero/firmware.uf2 /media/$USER/RPI-RP2/
 ```
 
 ## 使用方法
 
-1. RP2040ボードをBOOTSELモードで接続（BOOTSELボタンを押しながらUSB接続）
-2. `.uf2`ファイルをRP2040のマスストレージにコピー
-3. 自動的に再起動し、ファームウェアが動作開始
-4. USB CDC-ACMデバイスとして認識されます
-5. データを送信（例: Pythonスクリプト）
+1. `.uf2`ファイルをRP2040のマスストレージ（RPI-RP2）にコピー
+2. 自動的に再起動し、ファームウェアが動作開始
+3. USB CDC-ACMデバイス（`/dev/ttyACM0`）として認識されます
+4. Pythonから送信（例: led_matrix_software）
 
 ### 送信例（Python）
 
 ```python
-import serial
-import base64
+from led_matrix_software.devices import SerialLEDDevice
+from led_matrix_software.matrix import make_matrix_buffer
 
-# デバイスを開く
-ser = serial.Serial('/dev/ttyACM0', 921600, timeout=1)
-
-# 1bitモードの例（256 bytes）
-data_1bit = bytearray(256)
-# データを設定...
-
-encoded = base64.b64encode(data_1bit)
-ser.write(encoded + b'\n')
-
-# 8bitモードの例（2048 bytes）
-data_8bit = bytearray(2048)
-# 8つのビットプレーンデータを設定...
-
-encoded = base64.b64encode(data_8bit)
-ser.write(encoded + b'\n')
-
-ser.close()
+dev = SerialLEDDevice('/dev/ttyACM0')
+dev.write(make_matrix_buffer(img))          # 1bit (N=1)
+dev.write_grayscale(gray16x128, bits=6)     # 6bit grayscale
+dev.close()
 ```
 
 ## データ構造の詳細
@@ -193,10 +118,10 @@ matrix_buffer[8][16] (as uint16_t)
   └─ [7][0-15]: Panel 0, SIN_2
 ```
 
-### 8bitモードのビットプレーン
+### グレースケールのビットプレーン
 - ビットプレーン0（LSB）: 最も弱い輝度ビット
-- ビットプレーン7（MSB）: 最も強い輝度ビット
-- BAMにより、各ビットプレーンは重み付けされた時間で表示（2^n）
+- ビットプレーンN-1（MSB）: 最も強い輝度ビット（N≦6）
+- BAMにより、各ビットプレーンは重み付けされた時間で表示（2^n × BAM_UNIT_US、現在2us）
 
 ## ライセンス
 
